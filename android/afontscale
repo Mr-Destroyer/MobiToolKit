@@ -1,0 +1,23 @@
+#!/bin/bash
+LOCATION=$(dirname "$0")
+source "$LOCATION"/../common_tools
+
+set_font_scale(){
+  adb -s "$SELECTED_DEVICE" shell settings put system font_scale "$1"
+}
+
+android_choose_device
+if [ -z "$1" ] 2> /dev/null
+then
+  CURRENT_FONT_SIZE=$(adb -s "$SELECTED_DEVICE" shell settings get system font_scale)
+  if [ "$CURRENT_FONT_SIZE" != "1.0" ]; then
+    echo "🔄 Font scale restored to default \"1.0\""
+    set_font_scale "1.0"
+  else
+    echo "🔍 Setting bigger font scale to \"1.3\"..."
+    set_font_scale "1.3"
+  fi
+else
+  echo "🔍 Setting font scale to \"$1\"..."
+  set_font_scale "$1"
+fi

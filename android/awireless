@@ -1,0 +1,41 @@
+#!/bin/bash
+LOCATION=$(dirname "$0")
+source "$LOCATION"/../common_tools
+
+get_device_ip(){
+  android_choose_device
+  DEVICE_IP=$(adb -s "$SELECTED_DEVICE" shell ip route | awk '{print $9}')
+  DEVICE_IP=$(echo "$DEVICE_IP" | cut -d' ' -f1)
+}
+
+setup_network_connection(){
+  echo "🌎 Setting up wireless connection..."
+  adb -s "$SELECTED_DEVICE" tcpip 5555 &> /dev/null
+  echo "🌎 Getting device IP..."
+  delete_lastline
+  echo "🌎 Device IP: $DEVICE_IP"
+  echo "⏳ Connecting via local network..."
+  STATUS=$(adb connect "$DEVICE_IP:5555")
+
+  echo "$STATUS" | grep "refused" && echo "❌ Connection refused - already connected?" && return
+  echo "✅ Connected successfully, you can unplug the USB cable"
+}
+
+setup_usb_connection(){
+  echo "🔌 Disabling wireless connection..."
+  adb disconnect "$DEVICE_IP:5555" &> /dev/null
+  adb usb &> /dev/null
+}
+
+get_device_ip
+
+if [[ "$SELECTED_DEVICE" == "emulator"* ]]; then
+  echo "🤷‍ Emulator is wireless by default..."
+  exit 1
+fi
+
+if [ "$SELECTED_DEVICE" == "$DEVICE_IP:5555" ]; then
+  setup_usb_connection
+else
+  setup_network_connection
+fi

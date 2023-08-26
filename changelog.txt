@@ -1,0 +1,7 @@
+  🎉 This is a new version 1.4.0!
+
+    📹 arecord was updated to use scrcpy, this enables recording audio in your videos
+    You can still use the legacy variant by adding -l flag to arecord command
+
+    ⭐️ Special thanks to Luís Pinho for proposing and drafting this change
+    https://github.com/luispinho

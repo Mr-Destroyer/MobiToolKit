@@ -1,0 +1,58 @@
+#!/bin/bash
+trap "kill 0" SIGINT # Kill all spawned subprocesses on ctrl^c
+LOCATION=$(dirname "$0")
+source "$LOCATION"/../common_tools
+
+install_app(){
+  echo "⌛️ Installing \"$PACKAGE_NAME\" to $1..."
+  TEMPORARY_FILE="$TEMPORARY_FILE-$(date +%s)"
+  adb -s "$1" install -t -r "$2" &> "$TEMPORARY_FILE"
+  if grep -q Failure "$TEMPORARY_FILE" ; then
+    echo "❌ Installation to $1 failed!"
+    echo "🤕 Uninstall existing version or troubleshoot the package"
+    echo "🔥 Error details: $(grep 'Failure' "$TEMPORARY_FILE" | sed 's/^.*: //')"
+    exit 1
+  fi
+  echo "🚀 Launching $APP_NAME on $1..."
+  adb -s "$1" shell monkey -p "$PACKAGE_NAME" -c android.intent.category.LAUNCHER 1 &> /dev/null
+}
+
+check_args_valid(){
+  if [[ "$1" != "-a" ]]; then
+    FILE=$1
+  else
+    FILE=$2
+  fi
+
+  if [ ! -f "$PWD/$FILE" ] && [ ! -f "$FILE" ]; then
+      abort "🤷‍ Installation file not found!"
+  fi
+
+  if [[ "$FILE" != *".apk" ]]; then
+      abort "🤷 Unsupported file!"
+  fi
+}
+
+run()
+{
+  if [[ $1 == "-a" ]]; then
+    check_for_update
+    android_check_connected
+    android_get_devices_auth_dump
+    android_detect_package_info "$2"
+    for line in $(adb devices | grep -v "List"  | awk '{print $1}')
+    do
+      DEVICE=$(echo "$line" | awk '{print $1}')
+      install_app "$DEVICE" "$2" &
+    done
+    wait
+  else
+    android_choose_device
+    android_detect_package_info "$1"
+    install_app "$SELECTED_DEVICE" "$1"
+  fi
+}
+
+# "$@" - pass all arguments
+check_args_valid "$@"
+run "$@"

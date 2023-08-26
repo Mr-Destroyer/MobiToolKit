@@ -1,0 +1,74 @@
+#!/bin/bash
+LOCATION=$(dirname "$0")
+source "$LOCATION"/../common_tools
+trap 'ctrlc $@' 1 2 3 6 15
+
+RECORDING=false
+cd ~/Desktop || exit
+
+ctrlc(){
+  osascript -e 'quit app "QuickTime Player"'
+  if $RECORDING ; then
+    compress_video "$FILENAME"
+    echo "✅ Saved into ~/Desktop/$FILENAME"
+  fi
+  exit
+}
+
+check_videosnap_dependency(){ #TODO refactor when videosnap available via Homberew
+  if ! [ -x "$(command -v "videosnap")" ]; then
+    echo "💥 \"videosnap\" command required!"
+    should_proceed "🛒 Install via GitHub? (download and install \"videosnap-0.0.7.pkg\")"
+    open "https://github.com/matthutchinson/videosnap/releases/download/v0.0.7/videosnap-0.0.7.pkg"
+    exit 1
+  fi
+}
+
+start_quicktime(){
+	echo "🎬 Initializing QuickTime (webcam LED might turn on)..."
+	osascript <<EOD
+	tell application "QuickTime Player"
+		set newMovieRecording to new movie recording
+		set miniaturized of window 1 to true
+	end tell
+EOD
+}
+
+pick_recording_device(){
+  ios_choose_device
+  ios_device_info "$SELECTED_DEVICE"
+  DEVICE_NAME=$(go-ios devicename --udid="$SELECTED_DEVICE" --nojson)
+  FILENAME="$MANUFACTURER-$MODEL-iOS$VERSION-$(date +%Y-%m-%d-%H-%M-%S).mp4"
+}
+
+start_recording(){
+  RECORDING=true
+  echo "📹 Recording screen on $SELECTED_DEVICE ($DEVICE_NAME), stop it using ctrl^c"
+  videosnap -p High -d "$DEVICE_NAME" "$FILENAME" &> /dev/null
+}
+
+compress_video(){
+  if test -f "$1" ; then
+    echo "📦 Compressing video..."
+    ffmpeg -i "$1" "LQ-$1" -hide_banner -loglevel error #ultra basic ffmpeg compression
+    rm "$1" && mv "LQ-$1" "$1"
+  else
+    echo "❌ Video not captured possibly due to short recording time..."
+    osascript -e 'quit app "QuickTime Player"'
+    exit 1
+  fi
+}
+
+if uname -m | grep -q arm64 ; then
+  echo "🤕 This script is currently not working on M1 based macs"
+  echo "🔗 See https://github.com/matthutchinson/videosnap/issues/24"
+  echo "🩹 You can use \"iquicktime\" temporarily instead"
+  exit 1
+fi
+
+check_videosnap_dependency
+check_dependency "ffmpeg"
+
+start_quicktime
+pick_recording_device
+start_recording

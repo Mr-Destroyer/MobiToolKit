@@ -1,0 +1,35 @@
+#!/bin/bash
+trap "kill 0" SIGINT # Kill all spawned subprocesses on ctrl^c
+LOCATION=$(dirname "$0")
+source "$LOCATION"/../common_tools
+
+screenshot(){
+  android_device_info "$1"
+  FILENAME="$MANUFACTURER-$MODEL-API$SDK-$(date +%Y-%m-%d-%H-%M-%S).png"
+
+  android_get_storage_location_per_SDK "$SDK"
+
+  echo "📸 Saving screenshot into $FILENAME..."
+  adb -s "$1" shell screencap -p "$DEVICE_FILE_PATH"/output.png
+  adb -s "$1" pull "$DEVICE_FILE_PATH"/output.png ~/Desktop/"$FILENAME" &>/dev/null
+  adb -s "$1" shell rm "$DEVICE_FILE_PATH"/output.png
+}
+
+screenshot_all(){
+  check_for_update
+  android_get_devices_auth_dump
+  for line in $(adb devices | grep -v "List"  | awk '{print $1}')
+  do
+    device=$(echo "$line" | awk '{print $1}')
+    screenshot "$device" &
+  done
+  wait
+}
+
+if [ "$1" == "-a" ];
+then
+  screenshot_all
+else
+  android_choose_device
+  screenshot "$SELECTED_DEVICE"
+fi

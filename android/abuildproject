@@ -1,0 +1,88 @@
+#!/bin/bash
+# shellcheck disable=SC2181
+#ignore indirect exit code check at line 54
+
+LOCATION=$(dirname "$0")
+source "$LOCATION"/../common_tools
+
+trap 'cleanup $@' 1 2 3 6 15
+
+cleanup()
+{
+  if [ -n "$OLD_PWD" ]; then
+    cd "$OLD_PWD" || exit
+  fi
+  rm -f "$TASK_LIST"
+  exit
+}
+
+list_build_variants(){
+  if [ -n "$1" ];
+  then
+    OLD_PWD=$PWD
+    cd "$1" || exit
+  fi
+
+  if ! [ -f "gradlew" ];
+  then
+    echo "🤷‍ No Android project found in current directory"
+    exit
+  fi
+
+  TASK_LIST="toolkit_task_list.txt"
+  echo "⏳ Detecting build variants, this may take a while..."
+  ./gradlew tasks | grep '^install' > $TASK_LIST
+
+  if [ "$(nl "$TASK_LIST")" == "" ]; then
+    echo "🤷‍ No Android project build variants available! Aborting..."
+    exit
+  else
+    echo "🔨 Available:"
+    nl $TASK_LIST
+  fi
+}
+
+build_project_variant(){
+  read -r -p "📝 Choose build variant: " VARIANT_INDEX
+  TASK=$(sed "$VARIANT_INDEX"!d $TASK_LIST | awk '{ print $1 }' )
+  if [[ $VARIANT_INDEX == "" || $TASK == "" ]]; then
+    delete_lastline
+    build_project_variant
+  else
+    echo  "🚀 Triggering new build..."
+    ANDROID_SERIAL=$SELECTED_DEVICE ./gradlew "$TASK"
+  fi
+  if [ $? == "0" ];
+  then
+    VARIANT=${TASK#"install"}
+    echo  "✅ $VARIANT build variant installed successfully"
+  else
+    echo  "❌ $VARIANT build variant installation failed"
+  fi
+}
+
+find_apk_path(){
+  rm -rf "./outputs/apk/*"
+  APK_PATH=$(find . -iname "*.apk" | sort | tail -1)
+}
+
+launch(){
+  android_detect_package_info "$1"
+  echo "🚀 Launching $APP_NAME..."
+  adb -s "$SELECTED_DEVICE" shell monkey -p "$PACKAGE_NAME" -c android.intent.category.LAUNCHER 1 &> /dev/null
+}
+
+copy_apk_to_desktop(){
+  FILENAME=$(echo "$PACKAGE_NAME" | tr . _)
+  FILENAME="$FILENAME.apk"
+  cp "$APK_PATH" "$HOME/Desktop/$FILENAME"
+  echo "💾 \"$FILENAME\" saved to ~/Desktop"
+}
+
+android_choose_device
+list_build_variants "$@"
+build_project_variant
+find_apk_path
+launch "$APK_PATH"
+copy_apk_to_desktop
+cleanup

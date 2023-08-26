@@ -1,0 +1,656 @@
+#!/bin/bash
+# shellcheck disable=SC2034
+
+##############################################################################
+### VARs
+
+SCRIPT_LOCATION=$(dirname "$0")
+LAST_CHECK_DATE_FILE="$SCRIPT_LOCATION/../data/toolkit_last_check_date.txt"
+TEMPORARY_FILE="/private/tmp/mobile-toolkit-cache"
+
+REGEX_NUMBER='^[0-9]+$'
+
+##############################################################################
+### Android
+
+android_check_connected(){
+  android_get_devices
+  #No device connected
+  if [ ${#DEVICES[@]} -eq 0 ]
+  then
+    echo "❌ No Android devices detected"
+    exit 1
+  fi
+}
+
+android_wait_for_device(){
+  echo "⏳ Waiting for Android device..."
+  adb wait-for-any-device
+  android_get_devices
+}
+
+android_get_devices_auth_dump(){
+  DEVICES_DUMP="$SCRIPT_LOCATION/../data/toolkit_adb_devices_dump.txt"
+  rm -f $DEVICES_DUMP
+  adb devices | grep -v "List" >> $DEVICES_DUMP
+  if cat "$DEVICES_DUMP" | grep -q unauthorized ; then
+    read -r -p $'🚨 Unauthorized Android device detected!\n🔌 Reconnect it, allow USB debugging and press ENTER...'
+    android_get_devices_auth_dump
+  fi
+  if cat "$DEVICES_DUMP" | grep -q offline ; then
+    read -r -p $'🚨 Offline Android device detected!\n🔌 Wait until the startup is complete, then press ENTER...'
+    android_get_devices_auth_dump
+  fi
+}
+
+android_get_devices(){
+  #Populate array with device ids
+  DEVICES=()
+  android_get_devices_auth_dump
+  for LINE in $(cat $DEVICES_DUMP | awk '{print $1}')
+  do
+    DEVICE=$(echo "$LINE" | awk '{print $1}')
+    DEVICES+=("$DEVICE")
+  done
+}
+
+android_get_device_sdk(){
+  SDK=$(adb -s "$1" shell getprop ro.build.version.sdk | tr -cd '[[:alnum:]]._-')
+}
+
+android_device_info(){
+  MANUFACTURER=$(adb -s "$1" shell getprop ro.product.manufacturer | tr -cd '[[:alnum:]]._-')
+  MODEL=$(adb -s "$1" shell getprop ro.product.model | tr -cd '[[:alnum:]]._-')
+  VERSION=$(adb -s "$1" shell getprop ro.build.version.release | tr -cd '[[:alnum:]]._-')
+  SDK=$(adb -s "$1" shell getprop ro.build.version.sdk | tr -cd '[[:alnum:]]._-')
+  INFO=$(printf "%s) %s %s %s (API %s) - %s" "$NUMBER" "$MANUFACTURER" "$MODEL" "$VERSION" "$SDK" "$1")
+}
+
+android_choose_device() {
+  check_for_update
+  check_adb_dependency
+  android_check_connected
+
+  #Gather device info and choose device
+  if [ ${#DEVICES[@]} -gt 1 ]
+  then
+    NUMBER=1
+    echo "📱 Available devices:"
+    for ID in "${DEVICES[@]}"
+    do
+      android_device_info "$ID"
+      echo "$INFO"
+      ((NUMBER++))
+    done
+
+    read -r -p "📝 Select a device: " CHOICE
+    while :;
+    do
+    if [[ ! $CHOICE =~ $REGEX_NUMBER ]] || [ "$CHOICE" -le "0" -o "$CHOICE" -gt "${#DEVICES[@]}" ]; then
+      echo -en "\033[1A\033[2K" #deletes last echoed line in terminal
+      read -r -p "🤷 Invalid input, try again: " CHOICE
+    else
+      break
+    fi
+    done
+    SELECTED_DEVICE=${DEVICES[(($CHOICE-1))]}
+else
+  SELECTED_DEVICE="${DEVICES[0]}"
+fi
+
+SELECTED_DEVICE_MODEL=$(adb -s "$SELECTED_DEVICE" shell getprop ro.product.model | tr -cd '[[:alnum:]]._-')
+SELECTED_DEVICE_SDK=$(adb -s "$SELECTED_DEVICE" shell getprop ro.build.version.sdk | tr -cd '[[:alnum:]]._-')
+}
+
+android_device_unlocked(){
+  echo "📱 Checking screen status..."
+  adb -s "$1" shell dumpsys power | grep "mWakefulness=" | grep "Awake" &> /dev/null
+  return $?
+}
+
+android_get_foreground_package(){
+  android_get_device_sdk "$SELECTED_DEVICE"
+  if (( "$SDK" < 21 )); then
+    android_get_foreground_package_sdk_low
+  elif (( "$SDK" < 30 )); then
+    android_get_foreground_package_sdk_21_plus
+  elif (( "$SDK" < 31 )); then
+    android_get_foreground_package_sdk_30_plus
+  else
+    android_get_foreground_package_sdk_31_plus
+  fi
+}
+
+android_get_foreground_package_sdk_31_plus(){
+  adb -s "$SELECTED_DEVICE" shell dumpsys activity recents | grep 'Recent #0' | cut -d= -f3 | cut -d ':' -f2 | cut -d ' ' -f1
+}
+
+android_get_foreground_package_sdk_30_plus(){
+  adb -s "$SELECTED_DEVICE" shell dumpsys activity recents | grep 'Recent #0' | cut -d= -f6 |  cut -d ':' -f2 | cut -d ' ' -f1
+}
+
+android_get_foreground_package_sdk_21_plus(){
+  adb -s "$SELECTED_DEVICE" shell dumpsys activity recents | grep 'Recent #0' | cut -d= -f2 | sed 's| .*||' | cut -d '/' -f1
+}
+
+android_get_foreground_package_sdk_low(){
+  adb -s "$SELECTED_DEVICE" shell dumpsys window windows | grep mCurrentFocus | cut -d'/' -f1 | rev | cut -d' ' -f1 | rev
+}
+
+android_get_storage_location_per_SDK(){
+  if (( "$1" < 30 )); then
+    DEVICE_FILE_PATH="/mnt/sdcard"
+  else
+    DEVICE_FILE_PATH="/storage/self/primary"
+  fi
+}
+
+android_is_package_installed() {
+  adb -s "$SELECTED_DEVICE" shell pm list packages -f | sed -e 's/.*=//' | grep -w "$1" &> /dev/null
+  EXIT_CODE=$?
+  if [ $EXIT_CODE -ne 0 ]; then
+    echo "🤷‍ Package \"$1\" is not installed"
+    exit 1
+  fi
+}
+
+android_detect_package_info(){
+  echo "🔍 Detecting package name..."
+  AAPPT_PATH=$(find ~/Library/Android/sdk -name 'aapt' | sort | tail -1)
+  PACKAGE_INFO=$($AAPPT_PATH dump badging "$1" > $TEMPORARY_FILE)
+  PACKAGE_NAME=$(cat $TEMPORARY_FILE | grep package:\ name);
+  PACKAGE_NAME=$(echo "$PACKAGE_NAME" | sed 's/^[^'\'']*'\''//');
+  PACKAGE_NAME=$(echo "$PACKAGE_NAME" | sed 's/'\''.*//');
+  APP_NAME=$(cat $TEMPORARY_FILE  | grep application-label:)
+  APP_NAME=${APP_NAME#"application-label:"}
+}
+
+android_unlock_device(){
+  # arg1 = DEVICE_ID
+  # arg2 = MAX_RETRIES
+  MAX_RETRIES="$2"
+  UNLOCK_RETRIES=1
+until android_device_unlocked "$1";
+do
+    if [ "$UNLOCK_RETRIES" -le "$MAX_RETRIES" ]; then
+      echo "🔆 Screen on attempt $UNLOCK_RETRIES..."
+      ((UNLOCK_RETRIES++));
+      adb -s "$1" shell input keyevent KEYCODE_POWER
+      adb -s "$1" shell input keyevent 82
+      sleep 1;
+   else
+      read -r -p "❌ Screen-wake failed, press ANY KEY after manual unlock..."
+      break
+   fi
+ done
+
+ delete_lastline
+ echo "📱 Screen unlocked..."
+}
+
+##############################################################################
+### iOS
+
+check_go_ios_version(){
+  if ! [ -x "$(command -v "go-ios")" ]; then
+    install_go_ios
+  else
+    GO_IOS_VERSION=$(go-ios --version)
+    #echo "Version of go-ios is: $GO_IOS_VERSION"
+  fi
+}
+
+install_go_ios(){
+  echo "⏳ Installing https://github.com/danielpaulus/go-ios..."
+  check_dependency "go"
+  CURRENT_DIR="$PWD"
+  TOOLKIT_IOS_LOCATION=$(dirname "$0")
+  git clone "https://github.com/danielpaulus/go-ios.git" "$TOOLKIT_IOS_LOCATION/go-ios" &> /dev/null
+  cd "$TOOLKIT_IOS_LOCATION/go-ios"
+
+  go build .
+  chmod +x "go-ios"
+  mv "go-ios" "go-ios-temp"
+  mv "go-ios-temp" ..
+  cd ..
+  rm -rf "$TOOLKIT_IOS_LOCATION/go-ios"
+  mv "go-ios-temp" "go-ios"
+
+  cd "$CURRENT_DIR"
+}
+
+prompt_xcode_launch(){
+  echo "❌ Developer image is not mounted and/or device screen is locked"
+  should_proceed "❓ Do you want to open Xcode to fix it? (make sure you have the latest version)"
+  open -a Xcode
+  echo "⏳ Waiting for Xcode to launch..."
+  while true ; do
+    sleep 2
+    if [[ $(ps aux | grep -v grep | grep -c Xcode) -ne 0 ]]; then
+      break
+    fi
+  done
+  sleep 4
+  osascript -e 'quit app "Xcode"'
+}
+
+ios_get_devices(){
+  check_go_ios_version
+  check_dependency "jq"
+  IOS_USB_DEVICES=( $(go-ios list --nojson | sort -u) )
+}
+
+ios_pair_device(){
+  go-ios pair --udid="$1" --nojson &> /dev/null
+  EXIT_CODE=$?
+  if [ $EXIT_CODE -ne 0 ]; then
+    read -p "❌ Device is not paired - reconnect it, unlock screen, tap \"Trust\" and press ENTER..."
+    ios_pair_device "$1"
+  fi
+}
+
+ios_check_pairing(){
+  go-ios info --udid="$1" &> "$TEMPORARY_FILE"
+  if cat "$TEMPORARY_FILE" | grep -q 'UntrustedHostBUID' ; then
+    read -r -p "❌ Device is not paired - reconnect it, unlock screen, tap \"Trust\" and press ENTER..."
+    ios_pair_device "$1"
+  fi
+  if cat "$TEMPORARY_FILE" | grep -q 'could not retrieve PairRecord' ; then
+    read -r -p "❌ Device is not paired - reconnect it, unlock screen, tap \"Trust\" and press ENTER..."
+    ios_pair_device "$1"
+  fi
+}
+
+ios_check_developer_image(){
+  IS_MOUNTED=$((go-ios image list --udid="$1" --nojson) 2>&1)
+  if [[ $IS_MOUNTED == *"none"* ]]; then
+    prompt_xcode_launch
+    ios_check_developer_image "$1"
+  fi
+}
+
+ios_check_developer_image_and_pairing(){
+  ios_check_pairing "$1"
+  ios_check_developer_image "$1"
+}
+
+ios_device_info(){
+  ios_check_developer_image_and_pairing "$1"
+  MANUFACTURER="Apple"
+  go-ios info --udid="$1" > "$TEMPORARY_FILE"
+  MODEL=$(ios_translate_name "$(cat "$TEMPORARY_FILE" | jq -r '.HardwareModel')")
+  VERSION=$(cat "$TEMPORARY_FILE" | jq -r '.ProductVersion')
+  INFO=$(printf "%s) %s %s %s - %s" "$NUMBER" "$MANUFACTURER" "$MODEL" "$VERSION" "$ID")
+}
+
+ios_choose_device(){
+  check_for_update
+  ios_get_devices
+
+  if [ ${#IOS_USB_DEVICES[@]} -eq 0 ] #No device connected
+  then
+     echo "❌ No iOS devices detected"
+     exit 1
+  fi
+
+  if [ ${#IOS_USB_DEVICES[@]} -gt 1 ]
+  then
+     NUMBER=1
+     echo "📱 Available devices:"
+     for ID in "${IOS_USB_DEVICES[@]}"
+      do
+        ios_device_info "$ID"
+        echo "$INFO"
+        ((NUMBER++))
+      done
+
+      read -r -p "📝 Select a device: " CHOICE
+      while :;
+      do
+      if [[ ! $CHOICE =~ $REGEX_NUMBER ]] || [ "$CHOICE" -le "0" -o "$CHOICE" -gt "${#IOS_USB_DEVICES[@]}" ]; then
+        echo -en "\033[1A\033[2K" #deletes last echoed line in terminal
+        read -r -p "🤷 Invalid input, try again: " CHOICE
+      else
+        break
+      fi
+      done
+      SELECTED_DEVICE=${IOS_USB_DEVICES[(($CHOICE-1))]}
+  else
+     SELECTED_DEVICE="${IOS_USB_DEVICES[0]}"
+  fi
+}
+
+ios_get_installed_package_list(){
+  echo "⏳ Getting third-party package list..."
+  INSTALLED_PACKAGES=($(go-ios apps --udid="$1" | jq -r '.[] | .CFBundleIdentifier'))
+}
+
+ios_get_all_package_list(){
+  echo "⏳ Getting all package list..."
+  INSTALLED_PACKAGES=($(go-ios apps --udid="$1" | jq -r '.[] | .CFBundleIdentifier'))
+  SYSTEM_PACKAGES=($(go-ios apps --udid="$1" --system | jq -r '.[] | .CFBundleIdentifier'))
+  ALL_PACKAGES=("${INSTALLED_PACKAGES[@]}" "${SYSTEM_PACKAGES[@]}")
+}
+
+ios_is_package_installed(){
+  ios_get_all_package_list "$SELECTED_DEVICE"
+  echo "${ALL_PACKAGES[*]}" | grep -w "$1" &> /dev/null
+  EXIT_CODE=$?
+  if [ $EXIT_CODE -ne 0 ]; then
+    echo "🤷‍ Package \"$1\" is not installed"
+    exit 1
+  fi
+}
+
+ios_translate_name(){
+  # Translations here https://www.theiphonewiki.com/wiki/Models
+  NAME=$1
+  case $NAME in
+    "Purple"*|"purple"*)
+      NAME="iPhone"
+      ;;
+    "M68"*)
+      NAME="iPhone"
+      ;;
+    "N90"*|"N92"*)
+      NAME="iPhone4"
+      ;;
+    "N94"*)
+      NAME="iPhone4S"
+      ;;
+    "N88"*)
+      NAME="iPhone3GS"
+      ;;
+    "N82"*)
+      NAME="iPhone3G"
+      ;;
+    "N71"*)
+      NAME="iPhone6S"
+      ;;
+    "N66"*)
+      NAME="iPhone6SPlus"
+      ;;
+    "N61"*)
+      NAME="iPhone6"
+      ;;
+    "N56"*)
+      NAME="iPhone6Plus"
+      ;;
+    "N51"*|"N53"*)
+      NAME="iPhone5S"
+      ;;
+    "N48"*)
+      NAME="iPhone5C"
+      ;;
+    "N41"*|"N42"*)
+      NAME="iPhone5"
+      ;;
+    "D10"*)
+      NAME="iPhone7"
+      ;;
+    "D11"*)
+      NAME="iPhone7Plus"
+      ;;
+    "D20"*)
+      NAME="iPhone8"
+      ;;
+    "D21"*)
+      NAME="iPhone8Plus"
+      ;;
+    "D22"*|"Ferrari"*|"ferrari"*)
+      NAME="iPhoneX"
+      ;;
+    "D32"*)
+      NAME="iPhoneXS"
+      ;;
+    "D33"*)
+      NAME="iPhoneXSMax"
+      ;;
+    "N104"*)
+      NAME="iPhone11"
+      ;;
+    "D421"*)
+      NAME="iPhone11Pro"
+      ;;
+    "D431"*)
+      NAME="iPhone11ProMax"
+      ;;
+    "D52"*)
+      NAME="iPhone12Mini"
+      ;;
+    "D53g"*)
+      NAME="iPhone12"
+      ;;
+    "D53p"*)
+      NAME="iPhone12Pro"
+      ;;
+    "D54"*)
+      NAME="iPhone12ProMax"
+      ;;
+    "N84"*)
+      NAME="iPhoneXR"
+      ;;
+    "N69"*)
+      NAME="iPhoneSEgen1"
+      ;;
+    "D79"*)
+      NAME="iPhoneSEgen2"
+      ;;
+    "D17"*)
+      NAME="iPhone13"
+      ;;
+    "D16"*)
+      NAME="iPhone13Mini"
+      ;;
+    "D63"*)
+      NAME="iPhone13Pro"
+      ;;
+    "D64"*)
+      NAME="iPhone13ProMax"
+      ;;
+    "J1"*)
+      NAME="iPad3gen"
+      ;;
+    "J2"*)
+      NAME="iPad3gen"
+      ;;
+    "J72"*)
+      NAME="iPadAir"
+      ;;
+    "J82"*)
+      NAME="iPadAir2"
+      ;;
+    "J217"*|"J218"*)
+      NAME="iPadAir3gen"
+      ;;
+    "J307"*|"J308"*)
+      NAME="iPadAir4gen"
+      ;;
+    "J85"*)
+      NAME="iPadMiniRetina"
+      ;;
+    "J96"*)
+      NAME="iPadMini4"
+      ;;
+    "J210"*|"J211"*)
+      NAME="iPadMini5gen"
+      ;;
+    "J310"*|"J311"*)
+      NAME="iPadMini6gen"
+      ;;
+    "J98"*|"J99"*|"J31"*|"J127"*|"J128"*|"J318"*|"J317"*|"J207"*|"J208"*)
+      NAME="iPadPro"
+      ;;
+    "J120"*|"J121"*|"J417"*|"J418"*)
+      NAME="iPadPro2gen"
+      ;;
+    "J320"*|"J321"*|"J517"*|"J518"*)
+      NAME="iPadPro3gen"
+      ;;
+    "J420"*|"J421"*)
+      NAME="iPadPro4gen"
+      ;;
+    "J522"*|"J523"*)
+      NAME="iPadPro5gen"
+      ;;
+    "K48"*)
+      NAME="iPad"
+      ;;
+    "K93"*|"K94"*|"K95"*)
+      NAME="iPad2"
+      ;;
+    "P101"*|"P103"*)
+      NAME="iPad4gen"
+      ;;
+    "P105"*|"P107"*)
+      NAME="iPadMini"
+      ;;
+    "J71s"*|"J71t"*|"J72s"*|"J72t"*)
+      NAME="iPad5gen"
+      ;;
+    "J71b"*|"J72b"*)
+      NAME="iPad6gen"
+      ;;
+    "J171AP"*|"J172AP"*)
+      NAME="iPad7gen"
+      ;;
+    "J171aAP"*|"J172aAP"*)
+      NAME="iPad8gen"
+      ;;
+    "J181"*|"J182"*)
+      NAME="iPad9gen"
+      ;;
+  esac
+  echo $NAME
+}
+
+##############################################################################
+### Commons
+
+check_adb_dependency(){
+  if ! [ -x "$(command -v "adb")" ]; then
+    echo "🤷‍ Android Debug Bridge required!"
+    should_proceed "🔄 Install via homebrew? (this may take a while)"
+    brew install --cask "android-platform-tools"
+  fi
+}
+
+check_dependency(){
+  if ! [ -x "$(command -v "$1")" ]; then
+    echo "💥 \"$1\" command required!"
+    should_proceed "🛒 Install via homebrew? (this may take a while)"
+    brew install "$1"
+  fi
+}
+
+check_for_update(){
+  TODAY=$(date +%Y-%m-%d)
+  if [ -f "$LAST_CHECK_DATE_FILE" ]; then
+    LAST_CHECK_DATE=$(cat "$LAST_CHECK_DATE_FILE")
+  else
+    echo "$TODAY" > "$LAST_CHECK_DATE_FILE"
+  fi
+
+  CURRENT_DIR="$PWD"
+  cd "$SCRIPT_LOCATION/.." || exit
+  CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+  if [[ "$CURRENT_BRANCH" == "master" && "$LAST_CHECK_DATE" != "$TODAY" ]]; then
+    echo "🔄 Checking for Mobile Toolkit update..."
+    echo "$TODAY" > "$LAST_CHECK_DATE_FILE"
+
+    git fetch origin &> /dev/null
+    git status -uno | grep "up to date" &> /dev/null
+    if [ $? -ne 0 ]; then
+      yes_or_no "🆕 Update available, download now?";
+      if [[ "$RESPONSE" == "y" ||  "$RESPONSE" == "Y" ]]; then
+	echo "⏬ Updating..."
+	git pull &> /dev/null
+	echo "✨ New features:"
+	cat "$SCRIPT_LOCATION"/../changelog.txt
+	echo
+	echo "✅ Update complete"
+  exit 0
+      fi
+    fi
+  fi
+
+  cd "$CURRENT_DIR" || exit
+}
+
+delete_lastline(){
+  echo -en "\033[1A\033[2K"
+}
+
+yes_or_no(){
+  read -r -n 1 -p "$1 [y/n] " RESPONSE
+  case "$RESPONSE" in
+      [yY])
+          ;;
+      [nN])
+          ;;
+      *)
+        echo
+        echo "🤷‍ Invalid option"
+        yes_or_no "$1"
+        ;;
+  esac
+  echo
+}
+
+should_proceed(){
+  read -r -n 1 -p "$1 [y/n] " RESPONSE
+  case "$RESPONSE" in
+    [yY])
+      ;;
+    *)
+      exit
+      ;;
+  esac
+  echo
+}
+
+choose_number(){
+  MAX=$1
+  if [ -n "$2" ]; then
+    read -r -p "$2" CHOICE
+  else
+    read -r -p "📝 Choose number: " CHOICE
+  fi
+  while :;
+  do
+    if [[ -z $CHOICE  || $CHOICE -le 0 || $CHOICE -gt $MAX ]]; then
+      delete_lastline
+      read -r -p "🤷‍ Invalid choice, try again: " CHOICE
+    else
+      ((++CHOICE))
+      break
+    fi
+  done
+}
+
+check_url(){
+  URL=$1
+
+  if [[ $URL == "" ]]; then
+    read -r -p "📝 Insert web url: " URL
+    check_url "$URL"
+  else
+    case $1 in
+      'http://'*)
+        ;;
+      'https://'*)
+        ;;
+      *'://'*)
+        ;;
+      *)
+        URL='http://'$URL
+        ;;
+    esac
+  fi
+}
+
+abort(){
+  echo "$1"
+  exit 1
+}
